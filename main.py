@@ -1,0 +1,655 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import pandas as pd
+import requests
+import yfinance as yf
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+STATE_FILE = Path(os.getenv("STATE_FILE", "vix_reversal_state.json"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Core signal
+BREADTH_THRESHOLD = float(os.getenv("BREADTH_THRESHOLD", "40.0"))
+REGIME_USE_STRICT = os.getenv("REGIME_USE_STRICT", "1") == "1"
+
+# Middle condition
+VIX_MIN_LEVEL = float(os.getenv("VIX_MIN_LEVEL", "18.0"))
+VIX_1D_JUMP_PCT = float(os.getenv("VIX_1D_JUMP_PCT", "12.0"))
+VIX_3D_JUMP_PCT = float(os.getenv("VIX_3D_JUMP_PCT", "25.0"))
+
+# Extra filters
+SPY_DROP_TRIGGER = float(os.getenv("SPY_DROP_TRIGGER", "-1.0"))
+CANDIDATE_MIN_DROP = float(os.getenv("CANDIDATE_MIN_DROP", "-1.5"))
+USE_VIX3M_FILTER = os.getenv("USE_VIX3M_FILTER", "0") == "1"
+
+# Trade plan
+TOP_N = int(os.getenv("TOP_N", "2"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.06"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.10"))
+MAX_HOLD_DAYS = int(os.getenv("MAX_HOLD_DAYS", "5"))
+
+# Universe
+SPY_TICKER = "SPY"
+
+ETF_UNIVERSE = [
+    ("SMH", "VanEck Semiconductor ETF"),
+    ("SOXX", "iShares Semiconductor ETF"),
+    ("IGV", "iShares Expanded Tech-Software Sector ETF"),
+    ("QQQ", "Invesco QQQ Trust"),
+    ("XLK", "Technology Select Sector SPDR Fund"),
+    ("IWM", "iShares Russell 2000 ETF"),
+    ("XBI", "SPDR S&P Biotech ETF"),
+    ("ARKK", "ARK Innovation ETF"),
+    ("FDN", "First Trust Dow Jones Internet Index Fund"),
+    ("MTUM", "iShares MSCI USA Momentum Factor ETF"),
+]
+
+HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "730"))
+TIMEOUT = int(os.getenv("TIMEOUT", "20"))
+
+DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))
+DOWNLOAD_SLEEP_SEC = float(os.getenv("DOWNLOAD_SLEEP_SEC", "2.5"))
+BREADTH_BATCH_SIZE = int(os.getenv("BREADTH_BATCH_SIZE", "10"))
+
+# FRED series
+FRED_VIX_SERIES = "VIXCLS"
+
+
+# =========================================================
+# DATA STRUCTURES
+# =========================================================
+
+@dataclass
+class MarketRegime:
+    close: float
+    sma50: float
+    sma200: float
+    close_above_200: bool
+    sma50_above_200: bool
+    passed: bool
+
+
+@dataclass
+class SpyShock:
+    close: float
+    prev_close: float
+    day_return_pct: float
+    threshold: float
+    triggered: bool
+
+
+@dataclass
+class VixSignal:
+    close: float
+    prev_close: float
+    close_3d_ago: float
+    jump_1d_pct: float
+    jump_3d_pct: float
+    min_level_passed: bool
+    jump_1d_passed: bool
+    jump_3d_passed: bool
+    triggered: bool
+
+
+@dataclass
+class BreadthSignal:
+    total_count: int
+    valid_count: int
+    above_50_count: int
+    pct_above_50: float
+    threshold: float
+    triggered: bool
+
+
+@dataclass
+class CandidateETF:
+    ticker: str
+    name: str
+    close: float
+    day_return_pct: float
+    entry_price: float
+    stop_price: float
+    take_profit_price: float
+    score_rank: int
+
+
+@dataclass
+class SignalReport:
+    date_utc: str
+    signal_triggered: bool
+    regime: MarketRegime
+    spy_shock: SpyShock
+    vix: VixSignal
+    breadth: BreadthSignal
+    selected: List[CandidateETF]
+    reason: str
+
+
+# =========================================================
+# UTIL
+# =========================================================
+
+def utc_now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def load_state() -> Dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(data: Dict) -> None:
+    STATE_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def send_telegram(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Telegram env not set. Skipping send.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    resp = requests.post(url, json=payload, timeout=TIMEOUT)
+    resp.raise_for_status()
+
+
+def safe_pct(a: float, b: float) -> float:
+    if b == 0 or pd.isna(a) or pd.isna(b):
+        return float("nan")
+    return (a / b - 1.0) * 100.0
+
+
+def latest_two(series: pd.Series) -> Tuple[float, float]:
+    s = series.dropna()
+    if len(s) < 2:
+        raise RuntimeError("Not enough price history.")
+    return float(s.iloc[-1]), float(s.iloc[-2])
+
+
+def chunked(items: List[str], size: int) -> List[List[str]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+# =========================================================
+# MARKET DATA
+# =========================================================
+
+def get_sp500_tickers() -> List[str]:
+    csv_path = Path("sp500.csv")
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            "sp500.csv not found. Create a file named sp500.csv with one column named ticker."
+        )
+
+    df = pd.read_csv(csv_path)
+    if "ticker" not in df.columns:
+        raise ValueError("sp500.csv must contain a column named ticker.")
+
+    tickers = (
+        df["ticker"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .tolist()
+    )
+
+    if not tickers:
+        raise ValueError("sp500.csv ticker list is empty.")
+
+    return sorted(set(tickers))
+
+
+def download_single_close_history(ticker: str, period_days: int) -> pd.Series:
+    last_err = None
+
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            data = yf.download(
+                tickers=ticker,
+                period=f"{period_days}d",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+
+            if data is None or data.empty:
+                raise RuntimeError(f"{ticker}: empty download")
+
+            if isinstance(data.columns, pd.MultiIndex):
+                if (ticker, "Close") in data.columns:
+                    s = data[(ticker, "Close")].dropna()
+                elif ("Close", ticker) in data.columns:
+                    s = data[("Close", ticker)].dropna()
+                elif "Close" in data.columns.get_level_values(-1):
+                    close_cols = [c for c in data.columns if c[-1] == "Close"]
+                    s = data[close_cols[0]].dropna()
+                else:
+                    raise RuntimeError(f"{ticker}: Close column missing")
+            else:
+                if "Close" not in data.columns:
+                    raise RuntimeError(f"{ticker}: Close column missing")
+                s = data["Close"].dropna()
+
+            if s.empty:
+                raise RuntimeError(f"{ticker}: Close series empty")
+
+            s.name = ticker
+            return s.sort_index()
+
+        except Exception as e:
+            last_err = e
+            print(f"[WARN] download failed for {ticker} (attempt {attempt}/{DOWNLOAD_RETRIES}): {e}")
+            time.sleep(DOWNLOAD_SLEEP_SEC * attempt)
+
+    raise RuntimeError(f"Failed to download {ticker} after {DOWNLOAD_RETRIES} attempts: {last_err}")
+
+
+def download_core_close_history(tickers: List[str], period_days: int) -> Tuple[pd.DataFrame, List[str]]:
+    frames: List[pd.Series] = []
+    failed: List[str] = []
+
+    for ticker in tickers:
+        try:
+            s = download_single_close_history(ticker, period_days)
+            frames.append(s)
+            time.sleep(0.6)
+        except Exception as e:
+            print(f"[WARN] core ticker skipped: {ticker} | {e}")
+            failed.append(ticker)
+
+    if not frames:
+        raise RuntimeError("No core tickers downloaded successfully.")
+
+    df = pd.concat(frames, axis=1).sort_index()
+    return df, failed
+
+
+def download_batch_close_history(tickers: List[str], period_days: int) -> pd.DataFrame:
+    frames: List[pd.Series] = []
+
+    for batch in chunked(tickers, BREADTH_BATCH_SIZE):
+        print(f"[INFO] Downloading breadth batch: {batch}")
+        for ticker in batch:
+            try:
+                s = download_single_close_history(ticker, period_days)
+                frames.append(s)
+                time.sleep(0.4)
+            except Exception as e:
+                print(f"[WARN] skipping breadth ticker {ticker}: {e}")
+        time.sleep(DOWNLOAD_SLEEP_SEC)
+
+    if not frames:
+        raise RuntimeError("No breadth tickers downloaded successfully.")
+
+    df = pd.concat(frames, axis=1)
+    return df.sort_index()
+
+
+def download_fred_series(series_id: str) -> pd.Series:
+    last_err = None
+
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+            resp = requests.get(url, timeout=TIMEOUT)
+            resp.raise_for_status()
+
+            df = pd.read_csv(io.StringIO(resp.text))
+            if "DATE" not in df.columns or series_id not in df.columns:
+                raise RuntimeError(f"{series_id}: unexpected FRED CSV format")
+
+            df["DATE"] = pd.to_datetime(df["DATE"])
+            df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
+            s = df.set_index("DATE")[series_id].dropna()
+            s = s[s > 0]
+
+            if s.empty:
+                raise RuntimeError(f"{series_id}: empty FRED series")
+
+            s.name = series_id
+            return s.sort_index()
+
+        except Exception as e:
+            last_err = e
+            print(f"[WARN] FRED download failed for {series_id} (attempt {attempt}/{DOWNLOAD_RETRIES}): {e}")
+            time.sleep(DOWNLOAD_SLEEP_SEC * attempt)
+
+    raise RuntimeError(f"Failed to download FRED series {series_id}: {last_err}")
+
+
+# =========================================================
+# SIGNALS
+# =========================================================
+
+def compute_regime(spy_close: pd.Series) -> MarketRegime:
+    s = spy_close.dropna()
+    if len(s) < 220:
+        raise RuntimeError(f"Not enough SPY history for regime calculation. Only {len(s)} rows.")
+
+    close = float(s.iloc[-1])
+    sma50 = float(s.rolling(50).mean().iloc[-1])
+    sma200 = float(s.rolling(200).mean().iloc[-1])
+
+    close_above_200 = close > sma200
+    sma50_above_200 = sma50 > sma200
+    passed = close_above_200 and sma50_above_200 if REGIME_USE_STRICT else close_above_200
+
+    return MarketRegime(
+        close=round(close, 2),
+        sma50=round(sma50, 2),
+        sma200=round(sma200, 2),
+        close_above_200=close_above_200,
+        sma50_above_200=sma50_above_200,
+        passed=passed,
+    )
+
+
+def compute_spy_shock(spy_close: pd.Series, threshold: float) -> SpyShock:
+    close, prev_close = latest_two(spy_close)
+    day_return_pct = safe_pct(close, prev_close)
+    triggered = day_return_pct <= threshold
+
+    return SpyShock(
+        close=round(close, 2),
+        prev_close=round(prev_close, 2),
+        day_return_pct=round(day_return_pct, 2),
+        threshold=threshold,
+        triggered=triggered,
+    )
+
+
+def compute_vix_signal(vix_close: pd.Series) -> VixSignal:
+    s = vix_close.dropna()
+    if len(s) < 4:
+        raise RuntimeError("Not enough VIX history.")
+
+    close = float(s.iloc[-1])
+    prev_close = float(s.iloc[-2])
+    close_3d_ago = float(s.iloc[-4])
+
+    jump_1d_pct = safe_pct(close, prev_close)
+    jump_3d_pct = safe_pct(close, close_3d_ago)
+
+    min_level_passed = close >= VIX_MIN_LEVEL
+    jump_1d_passed = jump_1d_pct >= VIX_1D_JUMP_PCT
+    jump_3d_passed = jump_3d_pct >= VIX_3D_JUMP_PCT
+    triggered = min_level_passed and (jump_1d_passed or jump_3d_passed)
+
+    return VixSignal(
+        close=round(close, 2),
+        prev_close=round(prev_close, 2),
+        close_3d_ago=round(close_3d_ago, 2),
+        jump_1d_pct=round(jump_1d_pct, 2),
+        jump_3d_pct=round(jump_3d_pct, 2),
+        min_level_passed=min_level_passed,
+        jump_1d_passed=jump_1d_passed,
+        jump_3d_passed=jump_3d_passed,
+        triggered=triggered,
+    )
+
+
+def compute_breadth_signal(all_closes: pd.DataFrame, threshold: float) -> BreadthSignal:
+    valid_count = 0
+    above_50 = 0
+
+    for col in all_closes.columns:
+        s = all_closes[col].dropna()
+        if len(s) < 60:
+            continue
+
+        sma50 = s.rolling(50).mean().iloc[-1]
+        close = s.iloc[-1]
+
+        if pd.isna(sma50):
+            continue
+
+        valid_count += 1
+        if close > sma50:
+            above_50 += 1
+
+    total_count = len(all_closes.columns)
+    pct = 0.0 if valid_count == 0 else above_50 / valid_count * 100.0
+
+    return BreadthSignal(
+        total_count=total_count,
+        valid_count=valid_count,
+        above_50_count=above_50,
+        pct_above_50=round(pct, 2),
+        threshold=threshold,
+        triggered=pct <= threshold,
+    )
+
+
+def rank_candidates(etf_closes: pd.DataFrame, top_n: int, min_drop: float) -> List[CandidateETF]:
+    candidates: List[CandidateETF] = []
+
+    for ticker, name in ETF_UNIVERSE:
+        if ticker not in etf_closes.columns:
+            continue
+
+        s = etf_closes[ticker].dropna()
+        if len(s) < 2:
+            continue
+
+        close, prev_close = latest_two(s)
+        day_return_pct = safe_pct(close, prev_close)
+
+        if pd.isna(day_return_pct):
+            continue
+        if day_return_pct > min_drop:
+            continue
+
+        entry_price = round(close * 1.002, 2)
+        stop_price = round(close * (1.0 - STOP_LOSS_PCT), 2)
+        take_profit_price = round(close * (1.0 + TAKE_PROFIT_PCT), 2)
+
+        candidates.append(
+            CandidateETF(
+                ticker=ticker,
+                name=name,
+                close=round(close, 2),
+                day_return_pct=round(day_return_pct, 2),
+                entry_price=entry_price,
+                stop_price=stop_price,
+                take_profit_price=take_profit_price,
+                score_rank=0,
+            )
+        )
+
+    candidates.sort(key=lambda x: x.day_return_pct)
+
+    for i, c in enumerate(candidates, start=1):
+        c.score_rank = i
+
+    return candidates[:top_n]
+
+
+# =========================================================
+# REPORTING
+# =========================================================
+
+def build_reason(
+    regime: MarketRegime,
+    spy_shock: SpyShock,
+    vix: VixSignal,
+    breadth: BreadthSignal,
+    selected: List[CandidateETF],
+) -> str:
+    parts = []
+
+    parts.append("레짐 통과" if regime.passed else "레짐 미통과")
+    parts.append(
+        f"SPY {spy_shock.day_return_pct}% <= {spy_shock.threshold}%"
+        if spy_shock.triggered
+        else f"SPY 급락 미충족 ({spy_shock.day_return_pct}%)"
+    )
+    parts.append(f"VIX >= {VIX_MIN_LEVEL}" if vix.min_level_passed else f"VIX < {VIX_MIN_LEVEL}")
+    parts.append(f"VIX 1일 {vix.jump_1d_pct}% / 3일 {vix.jump_3d_pct}%")
+    parts.append("jump 통과" if (vix.jump_1d_passed or vix.jump_3d_passed) else "jump 미통과")
+    parts.append(
+        f"breadth {breadth.pct_above_50}% <= {breadth.threshold}%"
+        if breadth.triggered
+        else f"breadth {breadth.pct_above_50}% > {breadth.threshold}%"
+    )
+    parts.append(f"후보 {len(selected)}개" if selected else "후보 없음")
+
+    return " | ".join(parts)
+
+
+def build_message(report: SignalReport) -> str:
+    lines = []
+    lines.append("VIX 역추세 시스템 체크")
+    lines.append(f"시각: {report.date_utc}")
+    lines.append("")
+    lines.append(f"신호 발생: {'YES' if report.signal_triggered else 'NO'}")
+    lines.append(report.reason)
+    lines.append("")
+    lines.append(
+        f"SPY 레짐: close {report.regime.close:.2f} | 50MA {report.regime.sma50:.2f} | 200MA {report.regime.sma200:.2f}"
+    )
+    lines.append(
+        f"SPY 일간변화: {report.spy_shock.day_return_pct:.2f}% | 트리거 {report.spy_shock.threshold:.2f}%"
+    )
+    lines.append(
+        f"VIX: {report.vix.close:.2f} | 1일변화 {report.vix.jump_1d_pct:.2f}% | 3일변화 {report.vix.jump_3d_pct:.2f}% | 절대레벨 기준 {VIX_MIN_LEVEL:.2f}"
+    )
+    lines.append(
+        f"Breadth: {report.breadth.pct_above_50:.2f}% above 50DMA ({report.breadth.above_50_count}/{report.breadth.valid_count})"
+    )
+    lines.append("")
+
+    if report.signal_triggered and report.selected:
+        lines.append("매수 후보")
+        for c in report.selected:
+            lines.append(
+                f"- {c.ticker} {c.name} | 종가 {c.close:.2f} | 당일수익률 {c.day_return_pct:.2f}% | 진입 {c.entry_price:.2f} | 손절 {c.stop_price:.2f} | 익절 {c.take_profit_price:.2f}"
+            )
+        lines.append("")
+        lines.append(
+            f"보유 계획: 기본 {MAX_HOLD_DAYS}거래일, 손절 -{int(STOP_LOSS_PCT * 100)}%, 익절 +{int(TAKE_PROFIT_PCT * 100)}%"
+        )
+    else:
+        lines.append("오늘은 거래 없음")
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main() -> None:
+    sp500 = get_sp500_tickers()
+
+    core_tickers = [SPY_TICKER] + [x[0] for x in ETF_UNIVERSE]
+    core_tickers = sorted(set(core_tickers))
+
+    print(f"[INFO] Downloading core tickers for {len(core_tickers)} symbols...")
+    core_closes, failed_core = download_core_close_history(core_tickers, HISTORY_DAYS)
+    if failed_core:
+        print(f"[WARN] skipped core tickers: {failed_core}")
+
+    if SPY_TICKER not in core_closes.columns:
+        raise RuntimeError("SPY data missing. Required core ticker download failed.")
+
+    print("[INFO] Downloading VIX from FRED...")
+    vix_close = download_fred_series(FRED_VIX_SERIES)
+
+    print(f"[INFO] Downloading breadth tickers for {len(sp500)} symbols...")
+    breadth_source = download_batch_close_history(sp500, HISTORY_DAYS)
+
+    spy_close = core_closes[SPY_TICKER]
+    etf_cols = [x[0] for x in ETF_UNIVERSE if x[0] in core_closes.columns]
+    etf_closes = core_closes[etf_cols]
+
+    regime = compute_regime(spy_close)
+    spy_shock = compute_spy_shock(spy_close, SPY_DROP_TRIGGER)
+    vix = compute_vix_signal(vix_close)
+    breadth = compute_breadth_signal(breadth_source, BREADTH_THRESHOLD)
+
+    pre_selected = rank_candidates(etf_closes, TOP_N, CANDIDATE_MIN_DROP)
+
+    signal_triggered = (
+        regime.passed
+        and spy_shock.triggered
+        and vix.triggered
+        and breadth.triggered
+        and len(pre_selected) > 0
+    )
+
+    selected = pre_selected if signal_triggered else []
+
+    report = SignalReport(
+        date_utc=utc_now_str(),
+        signal_triggered=signal_triggered,
+        regime=regime,
+        spy_shock=spy_shock,
+        vix=vix,
+        breadth=breadth,
+        selected=selected,
+        reason=build_reason(regime, spy_shock, vix, breadth, selected),
+    )
+
+    state = load_state()
+    signal_key = f"{datetime.now(timezone.utc).date()}_{int(signal_triggered)}"
+    if selected:
+        signal_key += "_" + "_".join([c.ticker for c in selected])
+
+    message = build_message(report)
+
+    print(message)
+    print("")
+
+    if state.get("last_signal_key") != signal_key:
+        if signal_triggered:
+            send_telegram(message)
+            print("[INFO] Telegram alert sent.")
+        else:
+            print("[INFO] No trade signal. Telegram skipped.")
+        state["last_signal_key"] = signal_key
+        state["last_report"] = asdict(report)
+        save_state(state)
+    else:
+        print("[INFO] Duplicate signal. Skipped sending.")
+
+    out_path = Path("vix_reversal_last_report.json")
+    out_path.write_text(
+        json.dumps(asdict(report), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[INFO] Report saved to {out_path}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        raise
