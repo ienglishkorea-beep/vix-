@@ -19,15 +19,16 @@ jobs:
       TAKE_PROFIT_PCT: "0.10"
       MAX_HOLD_DAYS: "5"
       SPY_DROP_TRIGGER: "-1.0"
-      VIX_MIN_LEVEL: "20"
-      VIX_1D_JUMP_PCT: "15"
-      VIX_3D_JUMP_PCT: "30"
-      CANDIDATE_MIN_DROP: "-2.0"
+      VIX_MIN_LEVEL: "18"
+      VIX_1D_JUMP_PCT: "12"
+      VIX_3D_JUMP_PCT: "25"
+      CANDIDATE_MIN_DROP: "-1.5"
       USE_VIX3M_FILTER: "0"
       HISTORY_DAYS: "730"
       DOWNLOAD_RETRIES: "3"
       DOWNLOAD_SLEEP_SEC: "2.5"
       BREADTH_BATCH_SIZE: "10"
+      TIMEOUT: "20"
 
     steps:
       - uses: actions/checkout@v4
