@@ -1,0 +1,32 @@
+name: VIX Breadth Reversal Alert
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 21 * * 1-5"
+
+jobs:
+  run-alert:
+    runs-on: ubuntu-latest
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      VIX_LOOKBACK: "30"
+      BREADTH_THRESHOLD: "40"
+      REGIME_USE_STRICT: "1"
+      TOP_N: "2"
+      STOP_LOSS_PCT: "0.06"
+      TAKE_PROFIT_PCT: "0.10"
+      MAX_HOLD_DAYS: "5"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - run: python main.py
