@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import requests
@@ -23,20 +22,27 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Core signal
-VIX_LOOKBACK = int(os.getenv("VIX_LOOKBACK", "30"))          # 20 / 30 / 40 중 기본 30
 BREADTH_THRESHOLD = float(os.getenv("BREADTH_THRESHOLD", "40.0"))
 REGIME_USE_STRICT = os.getenv("REGIME_USE_STRICT", "1") == "1"
 
+# VIX jump filters
+VIX_MIN_LEVEL = float(os.getenv("VIX_MIN_LEVEL", "20.0"))
+VIX_1D_JUMP_PCT = float(os.getenv("VIX_1D_JUMP_PCT", "12.0"))   # 권장: 12%
+VIX_3D_JUMP_PCT = float(os.getenv("VIX_3D_JUMP_PCT", "25.0"))   # 권장: 25%
+
+# Added filters
+SPY_DROP_TRIGGER = float(os.getenv("SPY_DROP_TRIGGER", "-1.2"))      # SPY 당일 -1.2% 이하
+CANDIDATE_MIN_DROP = float(os.getenv("CANDIDATE_MIN_DROP", "-2.0"))  # 후보 ETF 당일 -2% 이하만
+
 # Trade plan
-TOP_N = int(os.getenv("TOP_N", "2"))                         # 상위 몇 개 ETF를 살지
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.06"))   # 6%
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.10"))  # 10%
-MAX_HOLD_DAYS = int(os.getenv("MAX_HOLD_DAYS", "5"))        # 기본 5거래일
+TOP_N = int(os.getenv("TOP_N", "2"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.06"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.10"))
+MAX_HOLD_DAYS = int(os.getenv("MAX_HOLD_DAYS", "5"))
 
 # Universe
 SPY_TICKER = "SPY"
 VIX_TICKER = "^VIX"
-BENCHMARK_TICKER = "SPY"
 
 ETF_UNIVERSE = [
     ("SMH", "VanEck Semiconductor ETF"),
@@ -71,10 +77,24 @@ class MarketRegime:
 
 
 @dataclass
+class SpyShock:
+    close: float
+    prev_close: float
+    day_return_pct: float
+    threshold: float
+    triggered: bool
+
+
+@dataclass
 class VixSignal:
     close: float
-    highest_in_window: float
-    lookback: int
+    prev_close: float
+    close_3d_ago: float
+    jump_1d_pct: float
+    jump_3d_pct: float
+    min_level_passed: bool
+    jump_1d_passed: bool
+    jump_3d_passed: bool
     triggered: bool
 
 
@@ -105,6 +125,7 @@ class SignalReport:
     date_utc: str
     signal_triggered: bool
     regime: MarketRegime
+    spy_shock: SpyShock
     vix: VixSignal
     breadth: BreadthSignal
     selected: List[CandidateETF]
@@ -115,7 +136,7 @@ class SignalReport:
 # UTIL
 # =========================================================
 
-def kst_now_str() -> str:
+def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
@@ -153,15 +174,18 @@ def safe_pct(a: float, b: float) -> float:
     return (a / b - 1.0) * 100.0
 
 
+def latest_two(series: pd.Series) -> Tuple[float, float]:
+    s = series.dropna()
+    if len(s) < 2:
+        raise RuntimeError("Not enough price history.")
+    return float(s.iloc[-1]), float(s.iloc[-2])
+
+
 # =========================================================
 # MARKET DATA
 # =========================================================
 
 def get_sp500_tickers() -> List[str]:
-    """
-    Wikipedia S&P 500 구성종목 테이블 사용.
-    모바일/개인 환경에서 바로 쓰기 쉬운 실전형.
-    """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     tables = pd.read_html(url)
     if not tables:
@@ -189,18 +213,9 @@ def download_close_history(tickers: List[str], period_days: int = HISTORY_DAYS) 
                 closes[t] = data[(t, "Close")]
         df = pd.DataFrame(closes)
     else:
-        # single ticker fallback
         df = pd.DataFrame({tickers[0]: data["Close"]})
 
-    df = df.sort_index()
-    return df
-
-
-def latest_two(series: pd.Series) -> Tuple[float, float]:
-    s = series.dropna()
-    if len(s) < 2:
-        raise RuntimeError("Not enough price history.")
-    return float(s.iloc[-1]), float(s.iloc[-2])
+    return df.sort_index()
 
 
 # =========================================================
@@ -218,7 +233,6 @@ def compute_regime(spy_close: pd.Series) -> MarketRegime:
 
     close_above_200 = close > sma200
     sma50_above_200 = sma50 > sma200
-
     passed = close_above_200 and sma50_above_200 if REGIME_USE_STRICT else close_above_200
 
     return MarketRegime(
@@ -231,27 +245,52 @@ def compute_regime(spy_close: pd.Series) -> MarketRegime:
     )
 
 
-def compute_vix_signal(vix_close: pd.Series, lookback: int) -> VixSignal:
+def compute_spy_shock(spy_close: pd.Series, threshold: float) -> SpyShock:
+    close, prev_close = latest_two(spy_close)
+    day_return_pct = safe_pct(close, prev_close)
+    triggered = day_return_pct <= threshold
+
+    return SpyShock(
+        close=round(close, 2),
+        prev_close=round(prev_close, 2),
+        day_return_pct=round(day_return_pct, 2),
+        threshold=threshold,
+        triggered=triggered,
+    )
+
+
+def compute_vix_signal(vix_close: pd.Series) -> VixSignal:
     s = vix_close.dropna()
-    if len(s) < lookback + 2:
+    if len(s) < 4:
         raise RuntimeError("Not enough VIX history.")
 
     close = float(s.iloc[-1])
-    highest = float(s.iloc[-lookback:].max())
-    triggered = math.isclose(close, highest, rel_tol=1e-10) or close >= highest
+    prev_close = float(s.iloc[-2])
+    close_3d_ago = float(s.iloc[-4])
+
+    jump_1d_pct = safe_pct(close, prev_close)
+    jump_3d_pct = safe_pct(close, close_3d_ago)
+
+    min_level_passed = close >= VIX_MIN_LEVEL
+    jump_1d_passed = jump_1d_pct >= VIX_1D_JUMP_PCT
+    jump_3d_passed = jump_3d_pct >= VIX_3D_JUMP_PCT
+
+    triggered = min_level_passed and (jump_1d_passed or jump_3d_passed)
 
     return VixSignal(
-        close=close,
-        highest_in_window=highest,
-        lookback=lookback,
+        close=round(close, 2),
+        prev_close=round(prev_close, 2),
+        close_3d_ago=round(close_3d_ago, 2),
+        jump_1d_pct=round(jump_1d_pct, 2),
+        jump_3d_pct=round(jump_3d_pct, 2),
+        min_level_passed=min_level_passed,
+        jump_1d_passed=jump_1d_passed,
+        jump_3d_passed=jump_3d_passed,
         triggered=triggered,
     )
 
 
 def compute_breadth_signal(all_closes: pd.DataFrame, threshold: float) -> BreadthSignal:
-    """
-    breadth = S&P500 구성종목 중 50일선 위 비율
-    """
     valid_cols = []
     above_50 = 0
 
@@ -281,7 +320,7 @@ def compute_breadth_signal(all_closes: pd.DataFrame, threshold: float) -> Breadt
     )
 
 
-def rank_candidates(etf_closes: pd.DataFrame, top_n: int) -> List[CandidateETF]:
+def rank_candidates(etf_closes: pd.DataFrame, top_n: int, min_drop: float) -> List[CandidateETF]:
     candidates: List[CandidateETF] = []
 
     for ticker, name in ETF_UNIVERSE:
@@ -295,7 +334,10 @@ def rank_candidates(etf_closes: pd.DataFrame, top_n: int) -> List[CandidateETF]:
         close, prev_close = latest_two(s)
         day_return_pct = safe_pct(close, prev_close)
 
-        entry_price = round(close * 1.002, 2)           # 다음날 약간 위 매수 기준
+        if day_return_pct > min_drop:
+            continue
+
+        entry_price = round(close * 1.002, 2)
         stop_price = round(close * (1.0 - STOP_LOSS_PCT), 2)
         take_profit_price = round(close * (1.0 + TAKE_PROFIT_PCT), 2)
 
@@ -312,7 +354,6 @@ def rank_candidates(etf_closes: pd.DataFrame, top_n: int) -> List[CandidateETF]:
             )
         )
 
-    # 가장 많이 빠진 순 = day_return_pct 오름차순
     candidates.sort(key=lambda x: x.day_return_pct)
 
     for i, c in enumerate(candidates, start=1):
@@ -325,23 +366,36 @@ def rank_candidates(etf_closes: pd.DataFrame, top_n: int) -> List[CandidateETF]:
 # REPORTING
 # =========================================================
 
-def build_reason(regime: MarketRegime, vix: VixSignal, breadth: BreadthSignal) -> str:
+def build_reason(
+    regime: MarketRegime,
+    spy_shock: SpyShock,
+    vix: VixSignal,
+    breadth: BreadthSignal,
+    selected: List[CandidateETF],
+) -> str:
     parts = []
 
-    if regime.passed:
-        parts.append("레짐 통과")
-    else:
-        parts.append("레짐 미통과")
-
-    if vix.triggered:
-        parts.append(f"VIX {vix.lookback}일 신고가")
-    else:
-        parts.append(f"VIX {vix.lookback}일 신고가 아님")
-
-    if breadth.triggered:
-        parts.append(f"breadth {breadth.pct_above_50}% <= {breadth.threshold}%")
-    else:
-        parts.append(f"breadth {breadth.pct_above_50}% > {breadth.threshold}%")
+    parts.append("레짐 통과" if regime.passed else "레짐 미통과")
+    parts.append(
+        f"SPY {spy_shock.day_return_pct}% <= {spy_shock.threshold}%"
+        if spy_shock.triggered
+        else f"SPY 급락 미충족 ({spy_shock.day_return_pct}%)"
+    )
+    parts.append(f"VIX >= {VIX_MIN_LEVEL}" if vix.min_level_passed else f"VIX < {VIX_MIN_LEVEL}")
+    parts.append(
+        f"VIX 1일 {vix.jump_1d_pct}% / 3일 {vix.jump_3d_pct}%"
+    )
+    parts.append(
+        f"jump 통과"
+        if (vix.jump_1d_passed or vix.jump_3d_passed)
+        else "jump 미통과"
+    )
+    parts.append(
+        f"breadth {breadth.pct_above_50}% <= {breadth.threshold}%"
+        if breadth.triggered
+        else f"breadth {breadth.pct_above_50}% > {breadth.threshold}%"
+    )
+    parts.append(f"후보 {len(selected)}개" if selected else "후보 없음")
 
     return " | ".join(parts)
 
@@ -358,7 +412,11 @@ def build_message(report: SignalReport) -> str:
         f"SPY 레짐: close {report.regime.close:.2f} | 50MA {report.regime.sma50:.2f} | 200MA {report.regime.sma200:.2f}"
     )
     lines.append(
-        f"VIX: {report.vix.close:.2f} | {report.vix.lookback}일 최고 {report.vix.highest_in_window:.2f}"
+        f"SPY 일간변화: {report.spy_shock.day_return_pct:.2f}% | 트리거 {report.spy_shock.threshold:.2f}%"
+    )
+    lines.append(
+        f"VIX: {report.vix.close:.2f} | 1일변화 {report.vix.jump_1d_pct:.2f}% | 3일변화 {report.vix.jump_3d_pct:.2f}% | "
+        f"절대레벨 기준 {VIX_MIN_LEVEL:.2f}"
     )
     lines.append(
         f"Breadth: {report.breadth.pct_above_50:.2f}% above 50DMA "
@@ -374,7 +432,9 @@ def build_message(report: SignalReport) -> str:
                 f"진입 {c.entry_price:.2f} | 손절 {c.stop_price:.2f} | 익절 {c.take_profit_price:.2f}"
             )
         lines.append("")
-        lines.append(f"보유 계획: 기본 {MAX_HOLD_DAYS}거래일, 손절 -{int(STOP_LOSS_PCT*100)}%, 익절 +{int(TAKE_PROFIT_PCT*100)}%")
+        lines.append(
+            f"보유 계획: 기본 {MAX_HOLD_DAYS}거래일, 손절 -{int(STOP_LOSS_PCT * 100)}%, 익절 +{int(TAKE_PROFIT_PCT * 100)}%"
+        )
     else:
         lines.append("오늘은 거래 없음")
 
@@ -386,7 +446,6 @@ def build_message(report: SignalReport) -> str:
 # =========================================================
 
 def main() -> None:
-    # 1) 가격 다운로드
     sp500 = get_sp500_tickers()
     base_tickers = [SPY_TICKER, VIX_TICKER] + [x[0] for x in ETF_UNIVERSE]
     all_tickers = sorted(set(sp500 + base_tickers))
@@ -394,7 +453,6 @@ def main() -> None:
     print(f"[INFO] Downloading data for {len(all_tickers)} tickers...")
     closes = download_close_history(all_tickers, HISTORY_DAYS)
 
-    # 2) 핵심 시리즈 분리
     if SPY_TICKER not in closes.columns or VIX_TICKER not in closes.columns:
         raise RuntimeError("SPY or VIX data missing.")
 
@@ -403,32 +461,39 @@ def main() -> None:
 
     etf_cols = [x[0] for x in ETF_UNIVERSE if x[0] in closes.columns]
     etf_closes = closes[etf_cols]
-
     breadth_source = closes[[c for c in sp500 if c in closes.columns]]
 
-    # 3) 신호 계산
     regime = compute_regime(spy_close)
-    vix = compute_vix_signal(vix_close, VIX_LOOKBACK)
+    spy_shock = compute_spy_shock(spy_close, SPY_DROP_TRIGGER)
+    vix = compute_vix_signal(vix_close)
     breadth = compute_breadth_signal(breadth_source, BREADTH_THRESHOLD)
 
-    signal_triggered = regime.passed and vix.triggered and breadth.triggered
-    selected = rank_candidates(etf_closes, TOP_N) if signal_triggered else []
+    pre_selected = rank_candidates(etf_closes, TOP_N, CANDIDATE_MIN_DROP)
+
+    signal_triggered = (
+        regime.passed
+        and spy_shock.triggered
+        and vix.triggered
+        and breadth.triggered
+        and len(pre_selected) > 0
+    )
+
+    selected = pre_selected if signal_triggered else []
 
     report = SignalReport(
-        date_utc=kst_now_str(),
+        date_utc=utc_now_str(),
         signal_triggered=signal_triggered,
         regime=regime,
+        spy_shock=spy_shock,
         vix=vix,
         breadth=breadth,
         selected=selected,
-        reason=build_reason(regime, vix, breadth),
+        reason=build_reason(regime, spy_shock, vix, breadth, selected),
     )
 
-    # 4) 중복 알림 방지
     state = load_state()
-    signal_key = f"{datetime.now(timezone.utc).date()}_{int(signal_triggered)}_{VIX_LOOKBACK}_{BREADTH_THRESHOLD}"
+    signal_key = f"{datetime.now(timezone.utc).date()}_{int(signal_triggered)}"
 
-    # 후보까지 묶어서 key 생성
     if selected:
         signal_key += "_" + "_".join([c.ticker for c in selected])
 
@@ -438,7 +503,6 @@ def main() -> None:
     print("")
 
     if state.get("last_signal_key") != signal_key:
-        # 신호 발생 시만 텔레그램 전송
         if signal_triggered:
             send_telegram(message)
             print("[INFO] Telegram alert sent.")
@@ -450,7 +514,6 @@ def main() -> None:
     else:
         print("[INFO] Duplicate signal. Skipped sending.")
 
-    # 5) 로컬 저장
     out_path = Path("vix_reversal_last_report.json")
     out_path.write_text(json.dumps(asdict(report), ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[INFO] Report saved to {out_path}")
